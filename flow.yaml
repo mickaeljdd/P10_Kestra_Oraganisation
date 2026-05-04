@@ -1,0 +1,224 @@
+id: reconciliation_vins
+namespace: marketing
+
+description: >
+  Pipeline de réconciliation ERP / WEB avec calcul du CA et détection des vins premium
+
+inputs:
+  - id: erp_file
+    type: STRING
+  - id: web_file
+    type: STRING
+  - id: liaison_file
+    type: STRING
+
+tasks:
+
+# =========================
+# 1. CHARGEMENT DES DONNÉES
+# =========================
+
+  - id: load_erp
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE erp AS
+      SELECT * FROM read_excel_auto('{{ inputs.erp_file }}');
+
+  - id: load_web
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE web AS
+      SELECT * FROM read_excel_auto('{{ inputs.web_file }}');
+
+  - id: load_liaison
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE liaison AS
+      SELECT * FROM read_excel_auto('{{ inputs.liaison_file }}');
+
+# =========================
+# 2. NETTOYAGE
+# =========================
+
+  - id: clean_erp
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE erp_clean AS
+      SELECT DISTINCT *
+      FROM erp
+      WHERE product_id IS NOT NULL;
+
+  - id: test_clean_erp
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.clean_erp.rowCount > 0 }}"
+
+  - id: clean_web
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE web_clean AS
+      SELECT *
+      FROM web
+      WHERE sku IS NOT NULL
+        AND total_sales IS NOT NULL
+        AND post_type = 'product';
+
+  - id: test_clean_web
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.clean_web.rowCount > 0 }}"
+
+  - id: clean_liaison
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE liaison_clean AS
+      SELECT DISTINCT *
+      FROM liaison
+      WHERE product_id IS NOT NULL
+        AND id_web IS NOT NULL;
+
+  - id: test_clean_liaison
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.clean_liaison.rowCount > 0 }}"
+
+# =========================
+# 3. JOINTURES
+# =========================
+
+  - id: join_erp_liaison
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE erp_liaison AS
+      SELECT *
+      FROM erp_clean e
+      JOIN liaison_clean l
+      ON e.product_id = l.product_id;
+
+  - id: test_join_erp_liaison
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.join_erp_liaison.rowCount > 0 }}"
+
+  - id: join_full
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE final_join AS
+      SELECT *
+      FROM erp_liaison el
+      JOIN web_clean w
+      ON el.id_web = w.sku;
+
+  - id: test_join_full
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.join_full.rowCount > 0 }}"
+
+# =========================
+# 4. CALCUL CHIFFRE D’AFFAIRES
+# =========================
+
+  - id: compute_ca
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE ca_table AS
+      SELECT
+        product_id,
+        price,
+        total_sales,
+        price * total_sales AS ca
+      FROM final_join;
+
+  - id: test_ca
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.compute_ca.rowCount > 0 }}"
+
+# =========================
+# 5. Z-SCORE & SEGMENTATION
+# =========================
+
+  - id: compute_zscore
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE zscore_table AS
+      SELECT *,
+        (price - AVG(price) OVER()) / STDDEV(price) OVER() AS z_score
+      FROM ca_table;
+
+  - id: test_zscore
+    type: io.kestra.plugin.core.assert.Assert
+    conditions:
+      - "{{ outputs.compute_zscore.rowCount > 0 }}"
+
+  - id: classify_products
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE classified AS
+      SELECT *,
+        CASE
+          WHEN z_score > 1 THEN 'premium'
+          ELSE 'ordinaire'
+        END AS categorie
+      FROM zscore_table;
+
+# =========================
+# 6. AGRÉGATIONS
+# =========================
+
+  - id: ca_by_product
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      CREATE TABLE ca_by_product AS
+      SELECT
+        product_id,
+        SUM(ca) AS total_ca
+      FROM classified
+      GROUP BY product_id;
+
+  - id: ca_total
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      SELECT SUM(ca) AS ca_total
+      FROM classified;
+
+# =========================
+# 7. EXPORTS
+# =========================
+
+  - id: export_ca
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      COPY ca_by_product TO 'ca_par_produit.csv' (HEADER, DELIMITER ',');
+
+  - id: export_premium
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      COPY (
+        SELECT * FROM classified WHERE categorie = 'premium'
+      ) TO 'vins_premium.csv' (HEADER, DELIMITER ',');
+
+  - id: export_ordinaires
+    type: io.kestra.plugin.duckdb.Query
+    sql: >
+      COPY (
+        SELECT * FROM classified WHERE categorie = 'ordinaire'
+      ) TO 'vins_ordinaires.csv' (HEADER, DELIMITER ',');
+
+# =========================
+# 8. PLANIFICATION
+# =========================
+
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.core.models.triggers.types.Schedule
+    cron: "0 9 15 * *"
+
+# =========================
+# 9. GESTION DES ERREURS
+# =========================
+
+retry:
+  type: constant
+  maxAttempt: 3
+  interval: PT5M
