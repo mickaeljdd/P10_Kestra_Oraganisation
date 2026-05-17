@@ -1,5 +1,5 @@
 id: reconciliation_vins
-namespace: marketing
+namespace: company.marketing
 
 description: >
   Pipeline de réconciliation ERP / WEB avec calcul du CA et détection des vins premium
@@ -7,203 +7,116 @@ description: >
 inputs:
   - id: erp_file
     type: STRING
+    defaults: /app/input/Fichier_erp.csv
   - id: web_file
     type: STRING
+    defaults: /app/input/Fichier_web.csv
   - id: liaison_file
     type: STRING
+    defaults: /app/input/fichier_liaison.csv
 
 tasks:
+  - id: build_reports
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    fetchType: FETCH_ONE
+    communityExtensions: []
+    outputFiles:
+      - ca_by_product
+      - premium
+      - ordinaires
+    sql: |
+      CREATE OR REPLACE TABLE erp AS
+      SELECT * FROM read_csv_auto('{{ inputs.erp_file }}');
 
-# =========================
-# 1. CHARGEMENT DES DONNÉES
-# =========================
+      CREATE OR REPLACE TABLE web AS
+      SELECT * FROM read_csv_auto('{{ inputs.web_file }}');
 
-  - id: load_erp
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE erp AS
-      SELECT * FROM read_excel_auto('{{ inputs.erp_file }}');
+      CREATE OR REPLACE TABLE liaison AS
+      SELECT * FROM read_csv_auto('{{ inputs.liaison_file }}');
 
-  - id: load_web
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE web AS
-      SELECT * FROM read_excel_auto('{{ inputs.web_file }}');
-
-  - id: load_liaison
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE liaison AS
-      SELECT * FROM read_excel_auto('{{ inputs.liaison_file }}');
-
-# =========================
-# 2. NETTOYAGE
-# =========================
-
-  - id: clean_erp
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE erp_clean AS
+      CREATE OR REPLACE TABLE erp_clean AS
       SELECT DISTINCT *
       FROM erp
       WHERE product_id IS NOT NULL;
 
-  - id: test_clean_erp
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.clean_erp.rowCount > 0 }}"
-
-  - id: clean_web
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE web_clean AS
+      CREATE OR REPLACE TABLE web_clean AS
       SELECT *
       FROM web
       WHERE sku IS NOT NULL
         AND total_sales IS NOT NULL
         AND post_type = 'product';
 
-  - id: test_clean_web
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.clean_web.rowCount > 0 }}"
-
-  - id: clean_liaison
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE liaison_clean AS
+      CREATE OR REPLACE TABLE liaison_clean AS
       SELECT DISTINCT *
       FROM liaison
       WHERE product_id IS NOT NULL
         AND id_web IS NOT NULL;
 
-  - id: test_clean_liaison
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.clean_liaison.rowCount > 0 }}"
-
-# =========================
-# 3. JOINTURES
-# =========================
-
-  - id: join_erp_liaison
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE erp_liaison AS
+      CREATE OR REPLACE TABLE final_join AS
       SELECT *
       FROM erp_clean e
       JOIN liaison_clean l
-      ON e.product_id = l.product_id;
-
-  - id: test_join_erp_liaison
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.join_erp_liaison.rowCount > 0 }}"
-
-  - id: join_full
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE final_join AS
-      SELECT *
-      FROM erp_liaison el
+        ON e.product_id = l.product_id
       JOIN web_clean w
-      ON el.id_web = w.sku;
+        ON CAST(l.id_web AS VARCHAR) = CAST(w.sku AS VARCHAR);
 
-  - id: test_join_full
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.join_full.rowCount > 0 }}"
-
-# =========================
-# 4. CALCUL CHIFFRE D’AFFAIRES
-# =========================
-
-  - id: compute_ca
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE ca_table AS
+      CREATE OR REPLACE TABLE classified AS
+      WITH ca_table AS (
+        SELECT
+          e.product_id,
+          CAST(e.price AS DOUBLE) AS price,
+          CAST(w.total_sales AS DOUBLE) AS total_sales,
+          CAST(e.price AS DOUBLE) * CAST(w.total_sales AS DOUBLE) AS ca
+        FROM final_join fj
+        JOIN erp_clean e ON fj.product_id = e.product_id
+        JOIN web_clean w ON CAST(fj.id_web AS VARCHAR) = CAST(w.sku AS VARCHAR)
+      ),
+      stats AS (
+        SELECT
+          AVG(price) AS avg_price,
+          STDDEV_SAMP(price) AS std_price
+        FROM ca_table
+      )
       SELECT
-        product_id,
-        price,
-        total_sales,
-        price * total_sales AS ca
-      FROM final_join;
-
-  - id: test_ca
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.compute_ca.rowCount > 0 }}"
-
-# =========================
-# 5. Z-SCORE & SEGMENTATION
-# =========================
-
-  - id: compute_zscore
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE zscore_table AS
-      SELECT *,
-        (price - AVG(price) OVER()) / STDDEV(price) OVER() AS z_score
-      FROM ca_table;
-
-  - id: test_zscore
-    type: io.kestra.plugin.core.assert.Assert
-    conditions:
-      - "{{ outputs.compute_zscore.rowCount > 0 }}"
-
-  - id: classify_products
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE classified AS
-      SELECT *,
+        c.*,
         CASE
-          WHEN z_score > 1 THEN 'premium'
+          WHEN s.std_price IS NULL OR s.std_price = 0 THEN 0
+          ELSE (c.price - s.avg_price) / s.std_price
+        END AS z_score,
+        CASE
+          WHEN s.std_price IS NOT NULL
+            AND s.std_price != 0
+            AND ((c.price - s.avg_price) / s.std_price) > 1 THEN 'premium'
           ELSE 'ordinaire'
         END AS categorie
-      FROM zscore_table;
+      FROM ca_table c
+      CROSS JOIN stats s;
 
-# =========================
-# 6. AGRÉGATIONS
-# =========================
-
-  - id: ca_by_product
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      CREATE TABLE ca_by_product AS
+      CREATE OR REPLACE TABLE ca_by_product AS
       SELECT
         product_id,
         SUM(ca) AS total_ca
       FROM classified
       GROUP BY product_id;
 
-  - id: ca_total
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      SELECT SUM(ca) AS ca_total
-      FROM classified;
+      COPY ca_by_product TO '{{ outputFiles.ca_by_product }}' (HEADER, DELIMITER ',');
 
-# =========================
-# 7. EXPORTS
-# =========================
-
-  - id: export_ca
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
-      COPY ca_by_product TO 'ca_par_produit.csv' (HEADER, DELIMITER ',');
-
-  - id: export_premium
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
       COPY (
         SELECT * FROM classified WHERE categorie = 'premium'
-      ) TO 'vins_premium.csv' (HEADER, DELIMITER ',');
+      ) TO '{{ outputFiles.premium }}' (HEADER, DELIMITER ',');
 
-  - id: export_ordinaires
-    type: io.kestra.plugin.duckdb.Query
-    sql: >
       COPY (
         SELECT * FROM classified WHERE categorie = 'ordinaire'
-      ) TO 'vins_ordinaires.csv' (HEADER, DELIMITER ',');
+      ) TO '{{ outputFiles.ordinaires }}' (HEADER, DELIMITER ',');
+
+      SELECT
+        (SELECT COUNT(*) FROM erp_clean) AS erp_rows,
+        (SELECT COUNT(*) FROM web_clean) AS web_rows,
+        (SELECT COUNT(*) FROM liaison_clean) AS liaison_rows,
+        (SELECT COUNT(*) FROM final_join) AS joined_rows,
+        (SELECT COUNT(*) FROM classified) AS classified_rows,
+        (SELECT COALESCE(SUM(ca), 0) FROM classified) AS total_ca;
+        (SELECT COUNT(*) FROM classified WHERE categorie = 'premium') AS millesimes
 
 # =========================
 # 8. PLANIFICATION
@@ -211,7 +124,7 @@ tasks:
 
 triggers:
   - id: monthly_schedule
-    type: io.kestra.core.models.triggers.types.Schedule
+    type: io.kestra.plugin.core.trigger.Schedule
     cron: "0 9 15 * *"
 
 # =========================
