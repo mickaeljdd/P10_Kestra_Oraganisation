@@ -1,9 +1,12 @@
 import pandas as pd
 
+
 def convert_excel_to_csv(excel_file, csv_file):
-    read_file = pd.read_excel(excel_file)
-    read_file.to_csv(csv_file, index=None, header=True)
-    df = pd.DataFrame(pd.read_csv(csv_file))
+    dataframe = pd.read_excel(excel_file)
+    dataframe.to_csv(csv_file, index=False, header=True)
+    return dataframe
+
+
 if __name__ == "__main__":
     add_rep = "./input/"
     list_of_excel_files = ["Fichier_erp.xlsx", "fichier_liaison.xlsx", "Fichier_web.xlsx"]
