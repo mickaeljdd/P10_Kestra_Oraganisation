@@ -16,6 +16,15 @@ inputs:
     defaults: /app/input/fichier_liaison.csv
 
 tasks:
+  - id: run_data_quality_tests
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - pip install -r /app/project/requirements.txt
+    commands:
+      - cd /app/project && python -m pytest -q -p no:cacheprovider
+
   - id: build_reports
     type: io.kestra.plugin.jdbc.duckdb.Queries
     fetchType: FETCH_ONE
@@ -115,8 +124,43 @@ tasks:
         (SELECT COUNT(*) FROM liaison_clean) AS liaison_rows,
         (SELECT COUNT(*) FROM final_join) AS joined_rows,
         (SELECT COUNT(*) FROM classified) AS classified_rows,
-        (SELECT COALESCE(SUM(ca), 0) FROM classified) AS total_ca;
-        (SELECT COUNT(*) FROM classified WHERE categorie = 'premium') AS millesimes
+        (SELECT COALESCE(SUM(ca), 0) FROM classified) AS total_ca,
+        (SELECT COUNT(*) FROM classified WHERE categorie = 'premium') AS premium_rows;
+
+  - id: generate_excel_report
+    type: io.kestra.plugin.scripts.python.Commands
+    beforeCommands:
+      - pip install pandas openpyxl
+    inputFiles:
+      ca_by_product.csv: "{{ outputs.build_reports.outputFiles.ca_by_product }}"
+      premium.csv: "{{ outputs.build_reports.outputFiles.premium }}"
+      ordinaires.csv: "{{ outputs.build_reports.outputFiles.ordinaires }}"
+    outputFiles:
+      - revenue_report.xlsx
+    commands:
+      - |
+        python - <<'PY'
+        import pandas as pd
+
+        ca_by_product = pd.read_csv("ca_by_product.csv")
+        premium = pd.read_csv("premium.csv")
+        ordinaires = pd.read_csv("ordinaires.csv")
+
+        summary = pd.DataFrame(
+            [
+                {"indicateur": "Nombre de produits avec CA", "valeur": len(ca_by_product)},
+                {"indicateur": "Chiffre d'affaires total", "valeur": ca_by_product["total_ca"].sum()},
+                {"indicateur": "Nombre de vins premium", "valeur": len(premium)},
+                {"indicateur": "Nombre de vins ordinaires", "valeur": len(ordinaires)},
+            ]
+        )
+
+        with pd.ExcelWriter("revenue_report.xlsx", engine="openpyxl") as writer:
+            summary.to_excel(writer, sheet_name="Synthese", index=False)
+            ca_by_product.to_excel(writer, sheet_name="CA par produit", index=False)
+            premium.to_excel(writer, sheet_name="Vins premium", index=False)
+            ordinaires.to_excel(writer, sheet_name="Vins ordinaires", index=False)
+        PY
 
 # =========================
 # 8. PLANIFICATION
