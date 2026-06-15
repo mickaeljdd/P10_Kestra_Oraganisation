@@ -17,6 +17,7 @@ services:
       - /tmp/kestra-wd:/tmp/kestra-wd
       - ./flow.yaml:/app/flows/flow.yaml:ro
       - ./input:/app/input:ro
+      - ./:/app/project:ro
     environment:
       KESTRA_CONFIGURATION: |
         kestra:
