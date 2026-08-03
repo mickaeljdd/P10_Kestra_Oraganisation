@@ -71,6 +71,70 @@ def test_premium_classification_produces_both_categories():
     joined = build_joined_dataset()
     prices = joined["price"]
     z_scores = (prices - prices.mean()) / prices.std()
-    categories = z_scores.apply(lambda score: "premium" if score > 1 else "ordinaire")
+    categories = z_scores.apply(lambda score: "premium" if score > 2 else "ordinaire")
 
     assert {"premium", "ordinaire"}.issubset(set(categories))
+
+def test_z_score_threshold_is_strictly_greater_than_two():
+    z_scores = pd.Series([1.99, 2.0, 2.01])
+
+    categories = z_scores.apply(
+        lambda score: "premium" if score > 2 else "ordinaire"
+    )
+
+    assert categories.tolist() == [
+        "ordinaire",
+        "ordinaire",
+        "premium",
+    ]
+
+def test_expected_row_counts():
+    erp, web, liaison = load_inputs()
+
+    # ERP : suppression des clés manquantes et des doublons
+    erp_clean = (
+        erp[
+            erp["product_id"].notna()
+        ]
+        .drop_duplicates()
+    )
+
+    # Liaison dédoublonnée avant suppression des clés manquantes
+    liaison_deduplicated = liaison.drop_duplicates()
+
+    # Liaison réellement utilisable pour les jointures
+    liaison_clean = (
+        liaison[
+            liaison["product_id"].notna()
+            & liaison["id_web"].notna()
+        ]
+        .drop_duplicates()
+    )
+
+    # Web : uniquement les produits exploitables
+    web_clean = (
+        web[
+            web["sku"].notna()
+            & web["total_sales"].notna()
+            & (web["post_type"] == "product")
+        ]
+        .drop_duplicates()
+    )
+
+    joined = build_joined_dataset()
+
+    assert len(erp_clean) == 825
+    assert len(liaison_deduplicated) == 825
+    assert len(liaison_clean) == 734
+    assert len(web_clean) == 714
+    assert len(joined) == 714
+
+def test_total_revenue_matches_expected_value():
+    joined = build_joined_dataset()
+
+    total_revenue = (
+        joined["price"].astype(float)
+        * joined["total_sales"].astype(float)
+    ).sum()
+
+    assert round(total_revenue, 2) == 70568.60

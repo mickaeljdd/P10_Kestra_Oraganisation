@@ -20,10 +20,13 @@ tasks:
     type: io.kestra.plugin.scripts.python.Commands
     taskRunner:
       type: io.kestra.plugin.core.runner.Process
+
     beforeCommands:
-      - pip install -r /app/project/requirements.txt
+      - /usr/bin/python3 -m pip install --break-system-packages -r /app/project/requirements.txt
+
     commands:
-      - cd /app/project && python -m pytest -q -p no:cacheprovider
+      - cd /app/project
+      - /usr/bin/python3 -m pytest -q -p no:cacheprovider
 
   - id: build_reports
     type: io.kestra.plugin.jdbc.duckdb.Queries
@@ -49,7 +52,7 @@ tasks:
       WHERE product_id IS NOT NULL;
 
       CREATE OR REPLACE TABLE web_clean AS
-      SELECT *
+      SELECT DISTINCT *
       FROM web
       WHERE sku IS NOT NULL
         AND total_sales IS NOT NULL
@@ -95,7 +98,7 @@ tasks:
         CASE
           WHEN s.std_price IS NOT NULL
             AND s.std_price != 0
-            AND ((c.price - s.avg_price) / s.std_price) > 1 THEN 'premium'
+            AND ((c.price - s.avg_price) / s.std_price) > 2 THEN 'premium'
           ELSE 'ordinaire'
         END AS categorie
       FROM ca_table c
@@ -130,7 +133,7 @@ tasks:
   - id: generate_excel_report
     type: io.kestra.plugin.scripts.python.Commands
     beforeCommands:
-      - pip install pandas openpyxl
+      - python3 -m pip install --break-system-packages pandas openpyxl
     inputFiles:
       ca_by_product.csv: "{{ outputs.build_reports.outputFiles.ca_by_product }}"
       premium.csv: "{{ outputs.build_reports.outputFiles.premium }}"
