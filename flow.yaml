@@ -18,6 +18,7 @@ inputs:
 tasks:
   - id: run_data_quality_tests
     type: io.kestra.plugin.scripts.python.Commands
+
     taskRunner:
       type: io.kestra.plugin.core.runner.Process
 
@@ -25,17 +26,21 @@ tasks:
       - /usr/bin/python3 -m pip install --break-system-packages -r /app/project/requirements.txt
 
     commands:
-      - cd /app/project
-      - /usr/bin/python3 -m pytest -q -p no:cacheprovider
+      - |
+        cd /app/project
+        /usr/bin/python3 -m pytest -v \
+          tests/test_data_quality.py \
+          tests/test_xlsxtocsv.py \
+          -p no:cacheprovider
 
   - id: build_reports
     type: io.kestra.plugin.jdbc.duckdb.Queries
     fetchType: FETCH_ONE
     communityExtensions: []
     outputFiles:
-      - ca_by_product
-      - premium
-      - ordinaires
+      - ca_by_product.csv
+      - premium.csv
+      - ordinaires.csv
     sql: |
       CREATE OR REPLACE TABLE erp AS
       SELECT * FROM read_csv_auto('{{ inputs.erp_file }}');
@@ -111,15 +116,15 @@ tasks:
       FROM classified
       GROUP BY product_id;
 
-      COPY ca_by_product TO '{{ outputFiles.ca_by_product }}' (HEADER, DELIMITER ',');
+      COPY ca_by_product TO '{{ outputFiles["ca_by_product.csv"] }}' (HEADER, DELIMITER ',');
 
       COPY (
         SELECT * FROM classified WHERE categorie = 'premium'
-      ) TO '{{ outputFiles.premium }}' (HEADER, DELIMITER ',');
+      ) TO '{{ outputFiles["premium.csv"] }}' (HEADER, DELIMITER ',');
 
       COPY (
         SELECT * FROM classified WHERE categorie = 'ordinaire'
-      ) TO '{{ outputFiles.ordinaires }}' (HEADER, DELIMITER ',');
+      ) TO '{{ outputFiles["ordinaires.csv"] }}' (HEADER, DELIMITER ',');
 
       SELECT
         (SELECT COUNT(*) FROM erp_clean) AS erp_rows,
@@ -132,39 +137,91 @@ tasks:
 
   - id: generate_excel_report
     type: io.kestra.plugin.scripts.python.Commands
-    beforeCommands:
-      - python3 -m pip install --break-system-packages pandas openpyxl
+
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+
     inputFiles:
-      ca_by_product.csv: "{{ outputs.build_reports.outputFiles.ca_by_product }}"
-      premium.csv: "{{ outputs.build_reports.outputFiles.premium }}"
-      ordinaires.csv: "{{ outputs.build_reports.outputFiles.ordinaires }}"
+      ca_by_product.csv: >-
+        {{ outputs.build_reports.outputFiles['ca_by_product.csv'] }}
+      premium.csv: >-
+        {{ outputs.build_reports.outputFiles['premium.csv'] }}
+      ordinaires.csv: >-
+        {{ outputs.build_reports.outputFiles['ordinaires.csv'] }}
+
     outputFiles:
       - revenue_report.xlsx
+
     commands:
       - |
-        python - <<'PY'
+        /usr/bin/python3 - <<'PY'
         import pandas as pd
 
-        ca_by_product = pd.read_csv("ca_by_product.csv")
+        ca = pd.read_csv("ca_by_product.csv")
         premium = pd.read_csv("premium.csv")
         ordinaires = pd.read_csv("ordinaires.csv")
 
-        summary = pd.DataFrame(
-            [
-                {"indicateur": "Nombre de produits avec CA", "valeur": len(ca_by_product)},
-                {"indicateur": "Chiffre d'affaires total", "valeur": ca_by_product["total_ca"].sum()},
-                {"indicateur": "Nombre de vins premium", "valeur": len(premium)},
-                {"indicateur": "Nombre de vins ordinaires", "valeur": len(ordinaires)},
-            ]
+        total_ca = round(ca["total_ca"].sum(), 2)
+
+        synthese = pd.DataFrame(
+            {
+                "indicateur": [
+                    "Nombre de produits",
+                    "Chiffre d'affaires total",
+                    "Nombre de vins premium",
+                    "Nombre de vins ordinaires",
+                ],
+                "valeur": [
+                    len(ca),
+                    total_ca,
+                    len(premium),
+                    len(ordinaires),
+                ],
+            }
         )
 
-        with pd.ExcelWriter("revenue_report.xlsx", engine="openpyxl") as writer:
-            summary.to_excel(writer, sheet_name="Synthese", index=False)
-            ca_by_product.to_excel(writer, sheet_name="CA par produit", index=False)
-            premium.to_excel(writer, sheet_name="Vins premium", index=False)
-            ordinaires.to_excel(writer, sheet_name="Vins ordinaires", index=False)
+        with pd.ExcelWriter(
+            "revenue_report.xlsx",
+            engine="openpyxl",
+        ) as writer:
+            synthese.to_excel(
+                writer,
+                sheet_name="Synthese",
+                index=False,
+            )
+            ca.to_excel(
+                writer,
+                sheet_name="CA par produit",
+                index=False,
+            )
+            premium.to_excel(
+                writer,
+                sheet_name="Vins premium",
+                index=False,
+            )
+            ordinaires.to_excel(
+                writer,
+                sheet_name="Vins ordinaires",
+                index=False,
+            )
         PY
+  - id: test_generated_reports
+    type: io.kestra.plugin.scripts.python.Commands
 
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+
+    beforeCommands:
+      - /usr/bin/python3 -m pip install --break-system-packages pandas openpyxl pytest
+
+    inputFiles:
+      ca_by_product.csv: "{{ outputs.build_reports.outputFiles['ca_by_product.csv'] }}"
+      premium.csv: "{{ outputs.build_reports.outputFiles['premium.csv'] }}"
+      ordinaires.csv: "{{ outputs.build_reports.outputFiles['ordinaires.csv'] }}"
+      revenue_report.xlsx: "{{ outputs.generate_excel_report.outputFiles['revenue_report.xlsx'] }}"
+
+    commands:
+      - /usr/bin/python3 -m pytest -v /app/project/tests/test_generated_reports.py
 # =========================
 # 8. PLANIFICATION
 # =========================
