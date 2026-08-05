@@ -21,7 +21,7 @@ Le flow Kestra execute `pytest` dans la tache `run_data_quality_tests` avant de 
 Pour les executer egalement en local :
 
 ```bash
-pytest
+python -m pytest -v \ tests/test_data_quality.py \ tests/test_xlsxtocsv.py
 ```
 
 Les tests verifient notamment la presence des colonnes attendues, la qualite des cles de jointure, la reconciliation ERP / WEB et le calcul du chiffre d'affaires.
